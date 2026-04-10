@@ -17,6 +17,8 @@ pub(crate) const DEFAULT_CODE_ACTION_CAPABILITIES: &[&str] = &[
     "source.organizeImports.biome",
     // fix all
     "source.fixAll.biome",
+    // config migrations
+    "source.biome.schema",
     // general refactors
     "refactor.biome",
     "refactor.extract.biome",

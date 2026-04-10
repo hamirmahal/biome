@@ -15,7 +15,10 @@ use crate::settings::{
 use crate::workspace::{CodeAction, FixFileResult, GetSyntaxTreeResult, PullActionsResult};
 use crate::{WorkspaceError, extension_error};
 use biome_analyze::options::PreferredQuote;
-use biome_analyze::{AnalysisFilter, AnalyzerConfiguration, AnalyzerOptions, ControlFlow, Never};
+use biome_analyze::{
+    ActionCategory, AnalysisFilter, AnalyzerAction, AnalyzerConfiguration, AnalyzerOptions,
+    ControlFlow, Never, RuleFilter,
+};
 use biome_configuration::Configuration;
 use biome_configuration::json::{
     JsonAllowCommentsEnabled, JsonAllowTrailingCommasEnabled, JsonAssistConfiguration,
@@ -23,6 +26,7 @@ use biome_configuration::json::{
     JsonLinterEnabled, JsonParserConfiguration,
 };
 use biome_deserialize::json::deserialize_from_json_ast;
+use biome_diagnostics::CodeSuggestion;
 use biome_formatter::{
     BracketSpacing, Expand, FormatError, IndentStyle, IndentWidth, LineEnding, LineWidth, Printed,
     TrailingNewline,
@@ -33,6 +37,7 @@ use biome_json_formatter::context::{JsonFormatOptions, TrailingCommas};
 use biome_json_formatter::format_node;
 use biome_json_parser::JsonParserOptions;
 use biome_json_syntax::{JsonFileSource, JsonLanguage, JsonRoot, JsonSyntaxNode};
+use biome_migrate::migrate_configuration;
 use biome_parser::AnyParse;
 use biome_rowan::{AstNode, NodeCache};
 use biome_rowan::{TextRange, TextSize, TokenAtOffset};
@@ -53,6 +58,46 @@ pub struct JsonFormatterSettings {
     pub bracket_spacing: Option<BracketSpacing>,
     pub enabled: Option<JsonFormatterEnabled>,
     pub trailing_newline: Option<TrailingNewline>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schema_migration_action;
+    use super::*;
+    use biome_json_parser::{JsonParserOptions, parse_json};
+
+    #[test]
+    fn returns_schema_migration_code_action_for_outdated_biome_json() {
+        let source = r#"{
+  "$schema": "https://biomejs.dev/schemas/1.0.0/schema.json"
+}"#;
+        let parsed = parse_json(source, JsonParserOptions::default());
+        let tree = parsed.tree();
+        let path = BiomePath::new("biome.json");
+
+        let action = schema_migration_action(&tree, &path, None).expect("expected action");
+        let updated = action.suggestion.suggestion.new_string(source);
+
+        assert_eq!(action.category.to_str(), "quickfix.biome.migrations.schema");
+        assert_eq!(updated, expected_output());
+    }
+
+    #[test]
+    fn does_not_return_schema_migration_code_action_for_matching_version() {
+        let version = option_env!("BIOME_VERSION").unwrap_or("0.0.0");
+        let source =
+            format!("{{\n  \"$schema\": \"https://biomejs.dev/schemas/{version}/schema.json\"\n}}");
+        let parsed = parse_json(source.as_str(), JsonParserOptions::default());
+        let tree = parsed.tree();
+        let path = BiomePath::new("biome.json");
+
+        assert!(schema_migration_action(&tree, &path, None).is_none());
+    }
+
+    fn expected_output() -> String {
+        let version = option_env!("BIOME_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+        format!("{{\n  \"$schema\": \"https://biomejs.dev/schemas/{version}/schema.json\"\n}}")
+    }
 }
 
 impl From<JsonFormatterConfiguration> for JsonFormatterSettings {
@@ -658,7 +703,74 @@ fn code_actions(params: CodeActionsParams) -> PullActionsResult {
         },
     );
 
+    if let Some(action) = schema_migration_action(&tree, path, working_directory) {
+        actions.push(action);
+    }
+
     PullActionsResult { actions }
+}
+
+fn schema_migration_action(
+    tree: &JsonRoot,
+    path: &BiomePath,
+    working_directory: Option<&Utf8Path>,
+) -> Option<CodeAction> {
+    if !path.ends_with(ConfigName::biome_json()) && !path.ends_with(ConfigName::biome_jsonc()) {
+        return None;
+    }
+
+    let enabled_rules = [RuleFilter::Rule("migrations", "schema")];
+    let filter = AnalysisFilter::from_enabled_rules(&enabled_rules);
+    let is_root = working_directory.is_some_and(|working_directory| {
+        path.as_path()
+            .strip_prefix(working_directory)
+            .is_ok_and(|relative_path| {
+                relative_path.starts_with(ConfigName::biome_json())
+                    || relative_path.starts_with(ConfigName::biome_jsonc())
+            })
+    });
+
+    let (action, errors) =
+        migrate_configuration(tree, filter, path.as_path(), is_root, |signal| match signal
+            .actions()
+            .next()
+        {
+            Some(action) => ControlFlow::Break(action),
+            None => ControlFlow::Continue(()),
+        });
+
+    for error in errors {
+        tracing::error!(?error, path = %path.as_path(), "failed to compute schema migration action");
+    }
+
+    action.map(action_to_code_action)
+}
+
+fn action_to_code_action(action: AnalyzerAction<JsonLanguage>) -> CodeAction {
+    let (span, suggestion) = action
+        .text_edit
+        .or_else(|| action.mutation.to_text_range_and_edit())
+        .unwrap_or_default();
+    let category = if action.category.matches("source.biome.schema") {
+        ActionCategory::QuickFix(Cow::Borrowed("migrations.schema"))
+    } else {
+        action.category
+    };
+
+    CodeAction {
+        category,
+        rule_name: action
+            .rule_name
+            .map(|(group, name)| (Cow::Borrowed(group), Cow::Borrowed(name))),
+        suggestion: CodeSuggestion {
+            span,
+            applicability: action.applicability,
+            msg: action.message,
+            suggestion,
+            labels: vec![],
+        },
+        offset: None,
+    }
 }
 
 #[instrument(level = "debug", skip(params))]

@@ -272,13 +272,16 @@ pub(crate) fn code_actions(
         })
         .chain(fix_all)
         .collect();
+    let migrate_schema_kind = CodeActionKind::new("source.biome.schema");
 
     // If any actions is marked as fixing a diagnostic, hide other actions
     // that do not fix anything (refactor opportunities) to reduce noise
     if has_fixes {
         actions.retain(|action| {
             if let CodeActionOrCommand::CodeAction(action) = action {
-                action.kind.as_ref() == Some(&fix_all_kind()) || action.diagnostics.is_some()
+                action.kind.as_ref() == Some(&fix_all_kind())
+                    || action.kind.as_ref() == Some(&migrate_schema_kind)
+                    || action.diagnostics.is_some()
             } else {
                 true
             }
